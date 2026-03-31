@@ -1,59 +1,29 @@
-import asyncio
+import io
+import random
 import re
+import tarfile
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple
 
-import aiohttp
-from aiohttp import ClientSession, ClientTimeout
+import requests
 
 from config import projConfig
 from utils.DBHelper import DBWriter, DBFetchAllFreePMC
 from utils.DataType import TempPMID
 from utils.LogHelper import print_error, medLog
+from utils.WebHelper import WebHelper
 
-# 把一些关于PDF相关的操作抽象出来了，方便其他模块调用
-
-# adjust the BATCH_SIZE in config.py according to your usage 
-# the default pdf batch size is 5
-BATCH_SIZE = projConfig.PDF_BatchSize
-
-
-# https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9034016/pdf/main.pdf
 
 class PDFHelper:
-    baseurl = "http://www.ncbi.nlm.nih.gov/"
-    # 没有采用https是因为听说https的审查会增加延时
     headers = {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'accept-language': 'en-US,en;q=0.9,en-GB;q=0.8,zh-CN;q=0.7,zh;q=0.6',
-        'cache-control': 'max-age=0',
-        'priority': 'u=0, i',
-        'sec-ch-ua': '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'none',
-        'sec-fetch-user': '?1',
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     }
-
-    def __init__(self, dbpath):
-        self.dbpath = dbpath
 
     @staticmethod
     def handle_error(e):
         print_error("Error occured: %s" % e)
-
-    @staticmethod
-    def __IsFileExist(path: str) -> bool:
-        return Path(path).exists()
-
-    @classmethod
-    def __IsPDFExist(cls, tempid) -> bool:
-        savepath = cls.__GetPDFSavePath(tempid)
-        return PDFHelper.__IsFileExist(savepath)
 
     @classmethod
     def __GetPDFFileName(cls, tempid: TempPMID) -> str:
@@ -64,169 +34,304 @@ class PDFHelper:
         return f"{projConfig.pdfSavePath}/{cls.__GetPDFFileName(tempid)}.pdf"
 
     @classmethod
-    def PDFBatchDownloadEntry(cls, limit):
-        """
-        异步批量处理的pdf下载函数
-        感觉写得稀烂啊
-        """
+    def __IsPDFExist(cls, tempid: TempPMID) -> bool:
+        return Path(cls.__GetPDFSavePath(tempid)).exists()
+
+    # ==================== 按选择下载（GUI 用） ====================
+
+    @classmethod
+    def PDFBatchDownloadWithSelection(cls, selected_pmcids: List[str]):
+        """根据用户在选择面板中勾选的 PMCID 列表下载 PDF。"""
         tablename = 'pubmed%s' % projConfig.savetime
         dbpath = 'pubmedsql'
-        # 注意这个列表的数据类型，和名称并不是相符的
-        # 这个返回的结果是有免费全文的，包括 FreeArticle 和 FreePMCArticle 两类
-        free_article_list: [TempPMID] = DBFetchAllFreePMC(dbpath, tablename)
 
-        free_pmc_list: [TempPMID] = [item for item in free_article_list if item.PMCID != ""]
+        all_items: List[TempPMID] = DBFetchAllFreePMC(dbpath, tablename)
+        target = [item for item in all_items
+                  if item.PMCID in selected_pmcids and not cls.__IsPDFExist(item)]
 
-        # 过滤掉已经存在于本地的文献
-        target_pmc_list: [TempPMID] = []  # target pdf list to be downloaded
+        if not target:
+            medLog.info("没有需要下载的 PDF")
+            return
 
-        for item in free_pmc_list:
+        cls._download_items(target, dbpath)
+
+    # ==================== 按数量下载（CLI 用） ====================
+
+    @classmethod
+    def PDFBatchDownloadEntry(cls, limit):
+        tablename = 'pubmed%s' % projConfig.savetime
+        dbpath = 'pubmedsql'
+        free_list: List[TempPMID] = DBFetchAllFreePMC(dbpath, tablename)
+        pmc_list = [item for item in free_list if item.PMCID]
+
+        target = []
+        for item in pmc_list:
             if cls.__IsPDFExist(item):
-                # 存在于目录当中直接更新就行了
                 cls.PDFUpdateDB(item, cls.__GetPDFSavePath(item), dbpath)
-                medLog.info(f"PDF: {cls.__GetPDFFileName(item)} 在保存目录当中已存在，跳过下载")
-                # 还没有下载就放到待下载列表当中
+                medLog.info(f"PDF 已存在，跳过: {cls.__GetPDFFileName(item)}")
             else:
-                target_pmc_list.append(item)
+                target.append(item)
+        target = target[:limit]
 
-        # limit the dowload number
-        # 这两个内容的index是相互对应的
-        target_pmc_list: [TempPMID] = target_pmc_list[:limit]
-        target_pmcid_list: [str] = [tempid.PMCID for tempid in target_pmc_list]
+        if not target:
+            medLog.info("没有需要下载的 PDF")
+            return
 
-        # 不用担心输入和返回的匹配的位置对应问题
-        pdf_list: [Optional[bytes]] = asyncio.run(cls.PDFBatchDonwloadAsync(target_pmcid_list))
+        cls._download_items(target, dbpath)
 
-        for index, pdf_content in enumerate(pdf_list):
-            temppmid = target_pmc_list[index]
-            if pdf_content is None:
-                medLog.error("PMCID: %s 从目标站获取pdf数据失败" % temppmid.PMCID)
-            else:
-
-                status = PDFHelper.PDFSaveFile(pdf_content, temppmid)
-                if status == True:
-                    # 将pdf文件名称以及存储位置等相关信息添加到sqlite数据库当中
-                    PDFHelper.PDFUpdateDB(temppmid, cls.__GetPDFSavePath(temppmid), dbpath)
-                else:
-                    medLog.error("保存pdf文件发生错误，自动跳过该文献PMCID为 %s" % temppmid.PMCID)
-                    continue
+    # ==================== 下载核心逻辑 ====================
 
     @classmethod
-    async def PDFBatchDonwloadAsync(cls, PMCID_list: list[str]) -> list[Optional[bytes]]:
-        """
-        异步下载pmc文献的函数，以pdf_batchsize作为一次请求的量
-        其中的pdf_batchsize可以通过config.py进行设置
-        """
-
-        pdf_list: list[Optional[bytes]] = []
-
-        for i in range(0, len(PMCID_list), BATCH_SIZE):
-            target = []
-            if i + BATCH_SIZE > len(PMCID_list):
-                target = PMCID_list[i:]
+    def _download_items(cls, items: List[TempPMID], dbpath: str):
+        medLog.info(f"查询 {len(items)} 篇文献的 OA 下载链接…")
+        url_map = {}
+        for item in items:
+            result = WebHelper.GetPDFUrlFromOA(item.PMCID)
+            if result:
+                url_map[item.PMCID] = result
             else:
-                target = PMCID_list[i:i + BATCH_SIZE]
+                medLog.warning(f"{item.PMCID} 无 OA 下载链接，跳过")
 
-            medLog.info(f"开始下载第 {i}-{i + len(target)}篇")
-            async with aiohttp.ClientSession(timeout=ClientTimeout(30)) as session:
-                start = time.time()
+        downloadable = [t for t in items if t.PMCID in url_map]
+        if not downloadable:
+            medLog.warning("没有可下载的 OA 文献")
+            return
 
-                tasks = [asyncio.create_task(cls.PDFdownloadAsync(session, PMCID)) for PMCID in target]
-                results = await asyncio.gather(*tasks)
-                end = time.time()
-
-                medLog.info("PDFBatchDonwloadAsync takes %.2f seconds." % (end - start))
-            pdf_list.extend(results)
-        return pdf_list
-
-    @classmethod
-    async def PDFdownloadAsync(cls, session: ClientSession, PMCID: str) -> Optional[bytes]:
-        downloadUrl = cls.baseurl + "pmc/articles/" + PMCID + "/pdf/main.pdf"
-        semaphore = asyncio.Semaphore(5)
-
-        async with semaphore:
+        medLog.info(f"开始下载 {len(downloadable)} 篇 PDF")
+        for item in downloadable:
+            url, fmt = url_map[item.PMCID]
             try:
-                response = await session.get(downloadUrl, headers=cls.headers)
-                content = await response.read()
-                medLog.info("%s.pdf 从目标站获取pdf数据成功" % tempid)
-                return content
-
-            except (aiohttp.ClientResponseError, aiohttp.ClientHttpProxyError) as e:
-                cls.handle_error(e)
-                medLog.error("%s.pdf 从目标站获取pdf数据失败" % tempid)
-                return None
-
+                pdf_bytes = cls._download_sync(url)
+                if pdf_bytes is None:
+                    continue
+                if fmt == "tgz":
+                    pdf_bytes = cls._extract_pdf_from_tgz(pdf_bytes, item.PMCID)
+                    if pdf_bytes is None:
+                        continue
+                if cls.PDFSaveFile(pdf_bytes, item):
+                    cls.PDFUpdateDB(item, cls.__GetPDFSavePath(item), dbpath)
             except Exception as e:
-                cls.handle_error(e)
-                medLog.error("%s.pdf 从目标站获取pdf数据失败" % tempid, )
-                return None
+                medLog.error(f"{item.PMCID} 处理出错: {e}")
 
     @classmethod
-    def PDFSaveFile(cls, html: bytes, tempid: TempPMID) -> bool:
-        """
-        将pdf保存到本地文件的功能
-        暂时还不确定能否支持异步，就先用同步版本了
-        """
-        # pdf = html.decode("utf-8")  # 使用Unicode8对二进制网页进行解码，直接写入文件就不需要解码了
-        if html is None:
-            return False
-
+    def _download_sync(cls, url: str) -> Optional[bytes]:
         try:
-            articleName = cls.__GetPDFFileName(tempid)
-            # 需要注意的是文件命名中不能含有以上特殊符号，只能去除掉
-            savepath = "%s/%s.pdf" % (projConfig.pdfSavePath, articleName)
-
-            cls.FileSave(html, savepath)
-            medLog.info("pdf文件写入成功,文件ID为 %s" % tempid.PMCID)
-            medLog.info("保存路径为 %s" % projConfig.pdfSavePath)
-            return True
+            r = requests.get(url, headers=cls.headers, timeout=60)
+            r.raise_for_status()
+            if len(r.content) > 1000:
+                medLog.info(f"下载成功 ({len(r.content)} bytes)")
+                return r.content
+            medLog.error(f"下载内容过小 ({len(r.content)} bytes)")
+            return None
         except Exception as e:
-            medLog.error(f"pdf文件写入失败, 文件ID为 {tempid.PMCID}, 检查路径")
-            medLog.error(e)
-            return False
+            medLog.error(f"下载失败: {e}")
+            return None
 
     @classmethod
-    def FileSave(cls, content: bytes, savepath: str) -> bool:
-        """
-        一个方便将文件保存操作分离出来基础函数
-        主要还是为独立的pdf下载函数服务的
-        """
+    def _extract_pdf_from_tgz(cls, tgz_bytes: bytes, pmcid: str) -> Optional[bytes]:
         try:
-            file = open(savepath, 'wb')
-            medLog.info("open success")
-            file.write(content)
-            file.close()
-            medLog.info("文件写入成功", "保存路径为%s" % savepath)
+            tf = tarfile.open(fileobj=io.BytesIO(tgz_bytes), mode="r:gz")
+            for member in tf.getmembers():
+                if member.name.lower().endswith(".pdf"):
+                    f = tf.extractfile(member)
+                    if f:
+                        medLog.info(f"{pmcid}: 从 tgz 提取 {member.name}")
+                        return f.read()
+            return None
+        except Exception as e:
+            medLog.error(f"{pmcid}: 解压 tgz 失败: {e}")
+            return None
+
+    @classmethod
+    def PDFSaveFile(cls, content: bytes, tempid: TempPMID) -> bool:
+        if not content:
+            return False
+        try:
+            savepath = cls.__GetPDFSavePath(tempid)
+            with open(savepath, 'wb') as f:
+                f.write(content)
+            medLog.info(f"PDF 保存成功: {tempid.PMCID}")
             return True
         except Exception as e:
-            medLog.error("文件写入失败", "保存路径为%s" % savepath)
-            medLog.error(e)
+            medLog.error(f"PDF 保存失败 {tempid.PMCID}: {e}")
             return False
 
     @classmethod
     def PDFUpdateDB(cls, tempid: TempPMID, savepath: str, dbpath: str) -> bool:
         tablename = 'pubmed%s' % projConfig.savetime
         try:
-            writeSql = " UPDATE %s SET savepath = ? WHERE PMCID =?" % tablename
-            param = (savepath, tempid.PMCID)
-            DBWriter(dbpath, writeSql, param)
-
-            medLog.info("pdf文件写入成功,文件ID为 %s" % tempid.PMCID)
-            medLog.info("地址写入到数据库pubmedsql下的table%s中成功" % tablename)
-            medLog.info("\n")
+            DBWriter(dbpath, f"UPDATE {tablename} SET savepath = ? WHERE PMCID = ?",
+                     (savepath, tempid.PMCID))
             return True
         except Exception as e:
-            medLog.error("pdf文件保存路径写入到数据库失败: %s" % e)
-            medLog.error("\n")
+            medLog.error(f"数据库更新失败: {e}")
             return False
 
+    @classmethod
+    def PDFUpdateDBByPMID(cls, pmid: str, savepath: str, dbpath: str) -> bool:
+        tablename = 'pubmed%s' % projConfig.savetime
+        try:
+            DBWriter(dbpath, f"UPDATE {tablename} SET savepath = ? WHERE PMID = ?",
+                     (savepath, pmid))
+            return True
+        except Exception as e:
+            medLog.error(f"数据库更新失败: {e}")
+            return False
 
-if __name__ == "__main__":
-    pmcid = "PMC6817243"
-    pmid = "35132177"
-    "PMC3606786"
-    "PMC8989886"
-    dbpath = 'pubmedsql'
+    # ==================== Sci-Hub 下载 ====================
 
-    tempid = TempPMID(doctitle="A rapid and efficientDNAextraction protocol from fresh and frozenhumanblood samples.",
-                      PMCID=pmcid, PMID=pmid)
+    SCIHUB_FALLBACK_DOMAINS = ["sci-hub.ru", "sci-hub.st", "sci-hub.se"]
+
+    @classmethod
+    def SciHubBatchDownload(cls, articles: List[Tuple[str, str, str]]):
+        """
+        通过 Sci-Hub 批量下载非免费文献。
+        articles: [(doi, pmid, doctitle), ...]
+        """
+        try:
+            import cloudscraper
+        except ImportError:
+            medLog.error("需要安装 cloudscraper: pip install cloudscraper")
+            return
+
+        dbpath = "pubmedsql"
+        user_domain = projConfig.scihubDomain.strip()
+        domains = [user_domain] + [d for d in cls.SCIHUB_FALLBACK_DOMAINS if d != user_domain]
+
+        # 逐个域名尝试建立连接（热身），找到第一个能用的
+        scraper, working_domain = cls._warmup_scihub(cloudscraper, domains)
+        if not scraper:
+            medLog.error("所有 Sci-Hub 域名均不可用，请检查网络或更换域名")
+            return
+
+        medLog.info(f"Sci-Hub 使用域名: {working_domain}, 待下载 {len(articles)} 篇")
+
+        success, fail = 0, 0
+        for i, (doi, pmid, doctitle) in enumerate(articles):
+            medLog.info(f"[{i+1}/{len(articles)}] 尝试下载: {doctitle[:50]}...")
+            try:
+                pdf_bytes = cls._scihub_download_one(scraper, working_domain, doi)
+
+                if pdf_bytes == "CAPTCHA":
+                    medLog.error(f"Sci-Hub 验证码保护已触发，中止下载。请用浏览器访问 https://{working_domain}/ 完成验证后重试")
+                    break
+
+                if pdf_bytes is None:
+                    fail += 1
+                    continue
+
+                tempid = TempPMID(PMCID="", PMID=pmid, doctitle=doctitle)
+                savepath = cls._PDFHelper__GetPDFSavePath(tempid)
+                if Path(savepath).exists():
+                    medLog.info(f"  文件已存在，跳过")
+                    success += 1
+                    continue
+
+                if cls.PDFSaveFile(pdf_bytes, tempid):
+                    cls.PDFUpdateDBByPMID(pmid, savepath, dbpath)
+                    success += 1
+                else:
+                    fail += 1
+            except Exception as e:
+                medLog.error(f"  处理出错: {e}")
+                fail += 1
+
+            if i < len(articles) - 1:
+                delay = random.uniform(3, 6)
+                medLog.info(f"  等待 {delay:.1f}s...")
+                time.sleep(delay)
+
+        medLog.info(f"Sci-Hub 下载完成: 成功 {success}, 失败 {fail}")
+
+    @classmethod
+    def _warmup_scihub(cls, cloudscraper_mod, domains: List[str]):
+        """
+        对各域名做热身，建立 DDoS-Guard session。
+        每次 403 时重新创建 scraper 实例（不同浏览器指纹），最多尝试 6 次。
+        返回 (scraper, working_domain) 或 (None, None)。
+        """
+        for d in domains:
+            medLog.info(f"连接 Sci-Hub: {d}...")
+            for attempt in range(6):
+                scraper = cloudscraper_mod.create_scraper(
+                    browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
+                try:
+                    r = scraper.get(f"https://{d}/", timeout=15)
+                    if r.status_code == 200:
+                        medLog.info(f"  {d} 连接成功 (第{attempt+1}次)")
+                        return scraper, d
+                    medLog.debug(f"  {d} 第{attempt+1}次: {r.status_code}")
+                except Exception as e:
+                    medLog.debug(f"  {d} 第{attempt+1}次: {type(e).__name__}")
+                time.sleep(2)
+        return None, None
+
+    @classmethod
+    def _scihub_download_one(cls, scraper, domain: str, doi: str) -> Optional[bytes]:
+        """从 Sci-Hub 下载单篇 PDF（参考 Zotero 的多重解析策略）。"""
+        from lxml import etree
+
+        url = f"https://{domain}/{doi}"
+        try:
+            r = scraper.get(url, timeout=30)
+            if r.status_code == 404:
+                medLog.warning(f"  文献未收录 (404)")
+                return None
+            if r.status_code != 200:
+                medLog.debug(f"  {domain}: 返回 {r.status_code}")
+                return None
+
+            # 检测验证码页面
+            if "robot" in r.text.lower()[:500] or "captcha" in r.text.lower()[:500] or "altcha" in r.text.lower()[:1000]:
+                medLog.error(f"  Sci-Hub 触发了验证码保护！请用浏览器访问 https://{domain}/ 完成验证后重试")
+                return "CAPTCHA"  # 特殊标记
+
+            # 多重策略提取 PDF URL：
+            pdf_url = None
+            tree = etree.HTML(r.text)
+
+            # 策略1: Zotero 方式 — #pdf 元素的 src
+            pdf_elem = tree.xpath('//*[@id="pdf"]/@src')
+            if pdf_elem and pdf_elem[0]:
+                pdf_url = pdf_elem[0]
+
+            # 策略2: embed/iframe 的 src
+            if not pdf_url:
+                for sel in ['//embed/@src', '//iframe/@src']:
+                    found = tree.xpath(sel)
+                    if found and '.pdf' in found[0].lower():
+                        pdf_url = found[0]
+                        break
+
+            # 策略3: 正则匹配页面中的 PDF 链接
+            if not pdf_url:
+                pdf_urls = re.findall(r"""//[^\s"'<>]+?\.pdf""", r.text)
+                if pdf_urls:
+                    pdf_url = pdf_urls[0]
+
+            if not pdf_url:
+                medLog.debug(f"  页面中未找到 PDF 链接")
+                return None
+
+            if pdf_url.startswith('//'):
+                pdf_url = 'https:' + pdf_url
+            elif pdf_url.startswith('/'):
+                pdf_url = f'https://{domain}{pdf_url}'
+
+            medLog.info(f"  PDF: ...{pdf_url[-50:]}")
+
+            r2 = scraper.get(pdf_url, timeout=60)
+            if r2.status_code != 200:
+                medLog.warning(f"  PDF 下载返回 {r2.status_code}")
+                return None
+
+            if len(r2.content) < 1000 or r2.content[:4] != b"%PDF":
+                medLog.warning(f"  下载内容不是有效 PDF ({len(r2.content)} bytes)")
+                return None
+
+            medLog.info(f"  下载成功 ({len(r2.content)} bytes)")
+            return r2.content
+
+        except Exception as e:
+            medLog.debug(f"  {domain}: {type(e).__name__}")
+            return None

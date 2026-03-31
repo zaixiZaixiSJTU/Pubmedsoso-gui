@@ -6,8 +6,15 @@ __pycache__/
 # personal config
 document/
 *.xls
+*.xlsx
 test.py
 pubmedsql
+
+# Log files
+*.log
+
+# Nuitka build output
+dist/
 
 
 # C extensions

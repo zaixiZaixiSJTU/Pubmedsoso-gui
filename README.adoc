@@ -33,6 +33,17 @@ openpyxl~=3.1.5
 colorlog~=6.9.0
 ----
 
+== GUI Mode
+
+In addition to the command-line interface, Pubmedsoso also provides a graphical user interface. You can launch it by running:
+
+[source, bash]
+----
+python gui.py
+----
+
+The GUI provides an intuitive interface for setting search keywords, page numbers, download counts, year range, and other parameters. It also displays real-time log output and progress during execution.
+
 == Usage
 
 . Clone the project and install the required dependency files in the command line environment.
@@ -121,7 +132,7 @@ With the above prompt, you can choose to export historical records from the `sql
 * [ ] Precise search and download, this is still a bit difficult*
 * [x] Custom keyword download, waiting for me to figure out the PubMed search parameter URL generation rules (already implemented)
 * [ ] Automatic completion download of non-free literature via SciHub, perhaps allowing users to write adapters themselves*
-* [ ] A usable GUI interface*
+* [x] A usable GUI interface (implemented with tkinter)
 * [ ] It would be best to include a free Baidu translation plugin, which might be useful sometimes*
 * [x] Refactor the project using OOP and more modern tools
 * [x] Refactor the code using asynchronous methods to improve execution efficiency
@@ -157,4 +168,6 @@ Additionally, `asyncio.run()` is used in multiple places in the project. During 
 2024.11.23 The author unexpectedly remembered this somewhat embarrassing project and quietly updated it, "Is this really the code I wrote? How could it be so bad?"
 
 2024.12.02 Refactored the entire code based on OOP, `xpath`, and `asyncio` asynchronous, removed the runtime speed limit, the speed is about 100 times the original, "I'm so tired after writing this."
+
+2026.03.31 Added GUI interface based on tkinter, added file selection UI, improved logging system, and enhanced PDF download functionality.
 

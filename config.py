@@ -18,6 +18,9 @@ class GlobalConfig:
         self.terminalLogLevel = logging.DEBUG
         self.fileLogLevel = logging.INFO
 
+        # Sci-Hub 配置（多个域名，按顺序尝试）
+        self.scihubDomain: str = "sci-hub.ru"
+
 
 # 下面这句在从其他模块导入这个变量执行就会自动执行，并且是一个全局共享的状态
 projConfig = GlobalConfig()

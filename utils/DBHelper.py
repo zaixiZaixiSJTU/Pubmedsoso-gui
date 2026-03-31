@@ -207,11 +207,26 @@ def DBFetchAllFreePMC(dbpath: str, tableName) -> list[TempPMID]:
     """
     相当于一个重载的 DBFetchAllPMID 函数，只返回了有pmc原文的部分
 
-    
+
     """
     ret = DBFetchAllPMID(dbpath, tableName)
 
     return [temppmid for temppmid in ret if temppmid.PMCID is not None]
+
+
+def DBFetchNonFreeWithDOI(dbpath: str, tableName) -> list[tuple]:
+    """
+    查询没有 PMCID 但有 DOI 的文献，用于 Sci-Hub 下载。
+    返回 [(doi, pmid, doctitle), ...]
+    """
+    try:
+        sql = "SELECT doi, PMID, doctitle FROM %s WHERE (PMCID IS NULL OR PMCID = '') AND doi IS NOT NULL AND doi != ''" % tableName
+        ret = DBReader(dbpath, sql)
+        medLog.info(f"查询到 {len(ret)} 篇有 DOI 的非免费文献")
+        return ret
+    except Exception as e:
+        medLog.error(f"查询非免费文献失败: {e}")
+        return []
 
 
 def DBFetchAllPMID(dbpath: str, tableName) -> list[TempPMID]:
